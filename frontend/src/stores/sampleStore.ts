@@ -31,12 +31,12 @@ export const useSampleStore = create<SampleStore>((set, get) => ({
     try {
       const payload = plain(input)
       const id = Number(await db.paperSamples.add(payload))
-      const created: PaperSample = { ...payload, id, schemaRev: 2 }
+      const created: PaperSample = { ...payload, id, schemaRev: 3 }
       set((state) => ({ paperSamples: [created, ...state.paperSamples] }))
       return created
     } catch {
       set({ error: '样本登记失败，请检查样本编号是否重复' })
-      return null
     }
+    return null
   },
 }))

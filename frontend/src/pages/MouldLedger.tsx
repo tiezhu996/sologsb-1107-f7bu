@@ -5,9 +5,10 @@ import { RulerInput } from '../components/common/RulerInput'
 import { useMouldFilter } from '../hooks/useMouldFilter'
 import { useUnitConvert } from '../hooks/useUnitConvert'
 import { useMouldStore } from '../stores/mouldStore'
-import { useRunStore } from '../stores/runStore'
+import { useRunChains, useRunStore } from '../stores/runStore'
 import { MOULD_STATES, WIRE_MATERIALS, type MouldInput, type MouldStateValue, type WireMaterial } from '../types/mould'
 import { calculateMeshDensity } from '../utils/stripe'
+import { latestActiveVersion } from '../utils/runChain'
 
 const emptyMouldForm: MouldInput = {
   mouldNo: '',
@@ -27,7 +28,7 @@ export default function MouldLedger() {
   const loadMoulds = useMouldStore((state) => state.loadMoulds)
   const addMould = useMouldStore((state) => state.addMould)
   const setMouldState = useMouldStore((state) => state.setMouldState)
-  const runs = useRunStore((state) => state.sheetRuns)
+  const chains = useRunChains()
   const loadRuns = useRunStore((state) => state.loadRuns)
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<MouldInput>(emptyMouldForm)
@@ -78,7 +79,7 @@ export default function MouldLedger() {
       <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: { xs: 'flex-start', md: 'center' }, flexDirection: { xs: 'column', md: 'row' } }}>
         <Box>
           <Typography component="h1" variant="h3" color="#344a34">纸帘台帐</Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.75 }}>维护帘框尺寸、丝材与帘纹密度，并登记修补状态。</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.75 }}>维护帘框尺寸、丝材与帘纹密度，并登记修补状态；修补后的帘纹参数只作用于新登记工序，历史工序保留当时快照。</Typography>
         </Box>
         <Button variant="contained" size="large" onClick={() => setShowForm((current) => !current)} data-testid="new-mould">
           {showForm ? '收起登记' : '新建纸帘'}
@@ -202,8 +203,14 @@ export default function MouldLedger() {
           </TableHead>
           <TableBody>
             {filteredMoulds.map((mould) => {
-              const relatedRuns = runs.filter((run) => run.mouldId === mould.id)
-              const latestRun = relatedRuns[0]
+              // 按修订链去重：一槽工序的多个版本只算一次引用；历史版优先用快照帘号
+              const relatedChains = chains.filter((chain) => {
+                const representative = latestActiveVersion(chain) ?? chain.head
+                const mouldNo = representative.mouldNoSnapshot
+                return representative.mouldId === mould.id || (mouldNo !== undefined && mouldNo === mould.mouldNo)
+              })
+              const latestChain = relatedChains[0]
+              const latestRunDate = latestChain ? (latestActiveVersion(latestChain) ?? latestChain.head).runDate : undefined
               return (
                 <TableRow key={mould.id ?? mould.mouldNo} data-testid="row-mould" hover>
                   <TableCell>
@@ -220,8 +227,8 @@ export default function MouldLedger() {
                   </TableCell>
                   <TableCell>{mould.weaver}</TableCell>
                   <TableCell>
-                    <Typography variant="body2">{relatedRuns.length} 槽工序</Typography>
-                    <Typography variant="caption" color="text.secondary">{latestRun ? `最近 ${latestRun.runDate}` : '尚无关联'}</Typography>
+                    <Typography variant="body2">{relatedChains.length} 槽工序</Typography>
+                    <Typography variant="caption" color="text.secondary">{latestRunDate ? `最近 ${latestRunDate}` : '尚无关联'}</Typography>
                   </TableCell>
                   <TableCell>
                     <Chip size="small" color={mould.state === '在用' ? 'success' : mould.state === '待修补' ? 'warning' : 'default'} label={mould.state} />

@@ -5,9 +5,10 @@ import { StatBadge } from '../components/common/StatBadge'
 import { useMouldFilter } from '../hooks/useMouldFilter'
 import { useFiberStore } from '../stores/fiberStore'
 import { useMouldStore } from '../stores/mouldStore'
-import { useRunStore } from '../stores/runStore'
+import { useRunChains, useRunStore } from '../stores/runStore'
 import { useSampleStore } from '../stores/sampleStore'
 import { isGapOutOfTolerance } from '../utils/stripe'
+import { findReferencedRun, isSampleStale, latestActiveVersion, resolveSampleRunState, standardGapOf } from '../utils/runChain'
 
 function startOfCurrentWeek(): Date {
   const date = new Date()
@@ -41,9 +42,9 @@ export default function Dashboard() {
   const batches = useFiberStore((state) => state.fiberBatches)
   const batchError = useFiberStore((state) => state.error)
   const loadBatches = useFiberStore((state) => state.loadFiberBatches)
-  const runs = useRunStore((state) => state.sheetRuns)
   const runError = useRunStore((state) => state.error)
   const loadRuns = useRunStore((state) => state.loadRuns)
+  const chains = useRunChains()
   const samples = useSampleStore((state) => state.paperSamples)
   const sampleError = useSampleStore((state) => state.error)
   const loadSamples = useSampleStore((state) => state.loadSamples)
@@ -56,14 +57,29 @@ export default function Dashboard() {
   }, [loadBatches, loadMoulds, loadRuns, loadSamples])
 
   const { filteredMoulds: activeMoulds } = useMouldFilter(moulds, '', '在用')
-  const currentWeekRuns = useMemo(() => runs.filter((run) => isInCurrentWeek(run.runDate)), [runs])
-  const runById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs])
+  const mouldById = useMemo(() => new Map(moulds.map((mould) => [mould.id, mould])), [moulds])
+
+  // 工作台只统计最新有效版：作废链与并列有效链不计入
+  const countedRuns = useMemo(() => chains.map(latestActiveVersion).filter((run): run is NonNullable<typeof run> => run !== null), [chains])
+  const currentWeekRuns = useMemo(() => countedRuns.filter((run) => isInCurrentWeek(run.runDate)), [countedRuns])
+  const conflictChains = useMemo(() => chains.filter((chain) => chain.hasConflict), [chains])
+  const voidedChains = useMemo(() => chains.filter((chain) => chain.voided), [chains])
+
   const pendingSamples = useMemo(
     () => samples.filter((sample) => {
-      const run = runById.get(sample.runId)
-      return sample.evenness !== '均匀' || (run ? isGapOutOfTolerance(run.deviation) : false)
+      const state = resolveSampleRunState(sample, chains)
+      if (state !== 'active') return false
+      const run = findReferencedRun(sample, chains)
+      if (!run) return false
+      const mould = mouldById.get(run.mouldId)
+      const deviation = run.measuredGap - standardGapOf(run, mould?.stripeGap)
+      return sample.evenness !== '均匀' || isGapOutOfTolerance(deviation)
     }),
-    [runById, samples],
+    [chains, mouldById, samples],
+  )
+  const staleSamples = useMemo(
+    () => samples.filter((sample) => isSampleStale(resolveSampleRunState(sample, chains))),
+    [chains, samples],
   )
   const activeRate = moulds.length ? Math.round((activeMoulds.length / moulds.length) * 100) : 0
   const error = mouldError ?? batchError ?? runError ?? sampleError
@@ -75,17 +91,23 @@ export default function Dashboard() {
           工作台
         </Typography>
         <Typography color="text.secondary" sx={{ mt: 0.75 }}>
-          汇总纸帘状态、料批与本周工序，优先处理超差帘纹和待复检样本。
+          汇总纸帘状态、料批与本周工序；统计只取每槽最新有效版，作废与并列有效版自动排除。
         </Typography>
       </Box>
 
       {error && <Alert severity="warning">{error}</Alert>}
+      {conflictChains.length > 0 && (
+        <Alert severity="error" data-testid="conflict-alert">
+          有 {conflictChains.length} 槽工序存在并列有效版（{conflictChains.map((chain) => chain.runNo).join('、')}），已在工序页标明并停止计入统计，请先作废多余版本。
+        </Alert>
+      )}
 
       <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
         <StatBadge label="在册纸帘" value={moulds.length} detail={`在用 ${activeMoulds.length} 张`} />
         <StatBadge label="纤维料批" value={batches.length} detail="覆盖四类造纸纤维" tone="bamboo" />
-        <StatBadge label="本周工序" value={currentWeekRuns.length} detail="按自然周统计" tone="bamboo" />
-        <StatBadge label="待复检样本" value={pendingSamples.length} detail="匀度或帘纹偏差需复核" tone={pendingSamples.length ? 'warning' : 'neutral'} />
+        <StatBadge label="本周工序" value={currentWeekRuns.length} detail="按自然周统计·仅最新有效版" tone="bamboo" />
+        <StatBadge label="待复检样本" value={pendingSamples.length} detail="引用最新有效版且需复核" tone={pendingSamples.length ? 'warning' : 'neutral'} />
+        <StatBadge label="已失效样本" value={staleSamples.length} detail="工序作废、缺失或并列有效" tone={staleSamples.length ? 'warning' : 'neutral'} />
       </Box>
 
       <Grid container spacing={2.5}>
@@ -96,7 +118,7 @@ export default function Dashboard() {
                 <Box>
                   <Typography variant="h5">纸帘配比与使用状态</Typography>
                   <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                    在用率 {activeRate}%，竹丝帘适合常规书写纸，铜丝帘用于细密帘纹。
+                    在用率 {activeRate}%，竹丝帘适合常规书写纸，铜丝帘用于细密帘纹。纸帘修补只影响新登记工序。
                   </Typography>
                 </Box>
                 <Chip label={`${activeMoulds.length}/${moulds.length} 在用`} color="success" variant="outlined" />
@@ -135,6 +157,25 @@ export default function Dashboard() {
             <CardContent sx={{ p: { xs: 2, md: 3 } }}>
               <Typography variant="h5" sx={{ mb: 2 }}>标准工序路径</Typography>
               <ProcessTimeline steps={processSteps} compact />
+              <Divider sx={{ my: 2.5 }} />
+              <Stack spacing={1.25}>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2" color="text.secondary">在册工序槽数</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }} data-testid="count-chain">{chains.length} 槽</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2" color="text.secondary">计入统计的有效槽数</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{countedRuns.length} 槽</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2" color="text.secondary">已作废工序</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700, color: voidedChains.length ? 'error.dark' : undefined }}>{voidedChains.length} 槽</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2" color="text.secondary">并列有效版异常</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 700, color: conflictChains.length ? 'error.dark' : undefined }}>{conflictChains.length} 槽</Typography>
+                </Box>
+              </Stack>
             </CardContent>
           </Card>
         </Grid>
@@ -146,7 +187,7 @@ export default function Dashboard() {
             <Box>
               <Typography variant="h5">待复检样本</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                偏差绝对值超过 0.2 mm 或透光匀度不达“均匀”的记录标黄。
+                仅列出引用最新有效版、且偏差绝对值超过 0.2 mm 或透光匀度不达“均匀”的记录；失效样本在样本页单独标明。
               </Typography>
             </Box>
             <Chip label={`${pendingSamples.length} 条提醒`} color={pendingSamples.length ? 'warning' : 'success'} />
@@ -156,7 +197,7 @@ export default function Dashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>样本号</TableCell>
-                  <TableCell>对应工序</TableCell>
+                  <TableCell>对应工序版本</TableCell>
                   <TableCell>匀度</TableCell>
                   <TableCell align="right">帘纹条数</TableCell>
                   <TableCell>帘纹偏差</TableCell>
@@ -165,12 +206,13 @@ export default function Dashboard() {
               </TableHead>
               <TableBody>
                 {pendingSamples.map((sample) => {
-                  const run = runById.get(sample.runId)
-                  const deviation = run?.deviation ?? 0
+                  const run = findReferencedRun(sample, chains)
+                  const mould = run ? mouldById.get(run.mouldId) : undefined
+                  const deviation = run ? run.measuredGap - standardGapOf(run, mould?.stripeGap) : 0
                   return (
                     <TableRow key={sample.id ?? sample.sampleNo} sx={{ bgcolor: '#fff8df' }}>
                       <TableCell sx={{ fontWeight: 700 }}>{sample.sampleNo}</TableCell>
-                      <TableCell>{run?.runNo ?? '工序待关联'}</TableCell>
+                      <TableCell>{run?.runNo ?? '工序待关联'} · 第 {run?.versionNo ?? 1} 版</TableCell>
                       <TableCell>{sample.evenness}</TableCell>
                       <TableCell align="right">{sample.stripeCount}</TableCell>
                       <TableCell>

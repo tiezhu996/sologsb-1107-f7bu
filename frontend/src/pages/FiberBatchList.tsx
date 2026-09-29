@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 import { Accordion, AccordionDetails, AccordionSummary, Alert, Box, Button, Card, CardContent, Chip, Divider, Grid, LinearProgress, Stack, Table, TableBody, TableCell, TableHead, TableRow, TextField, Typography } from '@mui/material'
 import { RulerInput } from '../components/common/RulerInput'
 import { useFiberStore } from '../stores/fiberStore'
-import { useRunStore } from '../stores/runStore'
+import { useRunChains, useRunStore } from '../stores/runStore'
 import { BLEACH_METHODS, COOK_AGENTS, FIBER_MATERIALS, type FiberBatchInput, type FiberMaterial, type CookAgent, type BleachMethod } from '../types/fiber-batch'
+import type { SheetRun } from '../types/sheet-run'
+import { latestActiveVersion } from '../utils/runChain'
 
 const emptyFiberForm: FiberBatchInput = {
   batchNo: '',
@@ -21,7 +23,7 @@ export default function FiberBatchList() {
   const error = useFiberStore((state) => state.error)
   const loadFiberBatches = useFiberStore((state) => state.loadFiberBatches)
   const addFiberBatch = useFiberStore((state) => state.addFiberBatch)
-  const runs = useRunStore((state) => state.sheetRuns)
+  const chains = useRunChains()
   const loadRuns = useRunStore((state) => state.loadRuns)
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<FiberBatchInput>(emptyFiberForm)
@@ -127,7 +129,11 @@ export default function FiberBatchList() {
 
       <Stack spacing={1.5}>
         {filteredBatches.map((batch) => {
-          const relatedRuns = runs.filter((run) => run.batchId === batch.id)
+          // 一槽工序只取最新有效版一次；作废与并列有效版不在业务列表中计数
+          const relatedRuns = chains
+            .filter((chain) => (latestActiveVersion(chain) ?? chain.head).batchId === batch.id)
+            .map(latestActiveVersion)
+            .filter((run): run is SheetRun => run !== null)
           return (
             <Accordion key={batch.id ?? batch.batchNo} data-testid="row-fiber" disableGutters sx={{ border: '1px solid #ddd2bd', borderRadius: '10px !important', '&::before': { display: 'none' } }}>
               <AccordionSummary expandIcon={<Box component="span" aria-hidden="true" sx={{ fontSize: 20, lineHeight: 1 }}>⌄</Box>}>
@@ -159,7 +165,7 @@ export default function FiberBatchList() {
                     <TableBody>
                       {relatedRuns.map((run) => (
                         <TableRow key={run.id ?? run.runNo}>
-                          <TableCell>{run.runNo}</TableCell><TableCell>{run.runDate}</TableCell><TableCell>{run.operator}</TableCell>
+                          <TableCell>{run.runNo}（第 {run.versionNo ?? 1} 版）</TableCell><TableCell>{run.runDate}</TableCell><TableCell>{run.operator}</TableCell>
                           <TableCell align="right">{run.grammage} 克/平方米</TableCell><TableCell align="right">{run.measuredGap.toFixed(2)} mm</TableCell>
                         </TableRow>
                       ))}
