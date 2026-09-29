@@ -4,7 +4,8 @@ export type EvennessLevel = (typeof EVENNESS_LEVELS)[number]
 export interface PaperSample {
   id?: number
   sampleNo: string
-  runId: number
+  /** 固定引用的工序版本记录 id（不随工序更正漂移） */
+  runVersionId: number | null
   sizeMm: number
   stripeCount: number
   evenness: EvennessLevel

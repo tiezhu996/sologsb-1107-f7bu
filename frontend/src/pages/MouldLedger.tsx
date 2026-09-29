@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, Box, Button, Card, CardContent, Chip, Divider, Grid, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material'
+import { Alert, Box, Button, Card, CardContent, Chip, Dialog, DialogActions, DialogContent, DialogTitle, Grid, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material'
 import { GrainStripePreview } from '../components/common/GrainStripePreview'
 import { RulerInput } from '../components/common/RulerInput'
 import { useMouldFilter } from '../hooks/useMouldFilter'
 import { useUnitConvert } from '../hooks/useUnitConvert'
 import { useMouldStore } from '../stores/mouldStore'
 import { useRunStore } from '../stores/runStore'
-import { MOULD_STATES, WIRE_MATERIALS, type MouldInput, type MouldStateValue, type WireMaterial } from '../types/mould'
+import { MOULD_STATES, WIRE_MATERIALS, type Mould, type MouldInput, type MouldStateValue, type WireMaterial } from '../types/mould'
+import { groupRuns } from '../utils/revisions'
 import { calculateMeshDensity } from '../utils/stripe'
 
 const emptyMouldForm: MouldInput = {
@@ -26,12 +27,14 @@ export default function MouldLedger() {
   const error = useMouldStore((state) => state.error)
   const loadMoulds = useMouldStore((state) => state.loadMoulds)
   const addMould = useMouldStore((state) => state.addMould)
-  const setMouldState = useMouldStore((state) => state.setMouldState)
+  const repairMould = useMouldStore((state) => state.repairMould)
   const runs = useRunStore((state) => state.sheetRuns)
   const loadRuns = useRunStore((state) => state.loadRuns)
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<MouldInput>(emptyMouldForm)
   const [submitting, setSubmitting] = useState(false)
+  const [repairTarget, setRepairTarget] = useState<Mould | null>(null)
+  const [repairGap, setRepairGap] = useState(1.1)
   const { mmPitchToThreadsPerCm } = useUnitConvert()
   const {
     mouldNo,
@@ -48,6 +51,20 @@ export default function MouldLedger() {
     void loadMoulds()
     void loadRuns()
   }, [loadMoulds, loadRuns])
+
+  // 每槽只统计最新有效版：纸帘修补后，旧工序仍按当时快照保留
+  const runGroupsByMould = useMemo(() => {
+    const map = new Map<number, { count: number; latestDate: string }>()
+    for (const group of groupRuns(runs)) {
+      const current = group.current
+      if (!current || group.conflicted) continue
+      const entry = map.get(current.mouldId) ?? { count: 0, latestDate: '' }
+      entry.count += 1
+      if (!entry.latestDate || current.runDate > entry.latestDate) entry.latestDate = current.runDate
+      map.set(current.mouldId, entry)
+    }
+    return map
+  }, [runs])
 
   const calculatedDensity = useMemo(
     () => calculateMeshDensity(form.wireDiameter, form.stripeGap),
@@ -73,12 +90,24 @@ export default function MouldLedger() {
     }
   }
 
+  const openRepair = (mould: Mould) => {
+    setRepairTarget(mould)
+    setRepairGap(mould.stripeGap)
+  }
+
+  const handleRepair = async () => {
+    if (!repairTarget || repairTarget.id === undefined) return
+    const nextState: MouldStateValue = repairTarget.state === '待修补' ? '在用' : '待修补'
+    await repairMould(repairTarget.id, nextState, repairGap)
+    setRepairTarget(null)
+  }
+
   return (
     <Stack spacing={3}>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: { xs: 'flex-start', md: 'center' }, flexDirection: { xs: 'column', md: 'row' } }}>
         <Box>
           <Typography component="h1" variant="h3" color="#344a34">纸帘台帐</Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.75 }}>维护帘框尺寸、丝材与帘纹密度，并登记修补状态。</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.75 }}>维护帘框尺寸、丝材与帘纹密度，并登记修补状态；修补只影响新工序，不回改历史。</Typography>
         </Box>
         <Button variant="contained" size="large" onClick={() => setShowForm((current) => !current)} data-testid="new-mould">
           {showForm ? '收起登记' : '新建纸帘'}
@@ -202,8 +231,7 @@ export default function MouldLedger() {
           </TableHead>
           <TableBody>
             {filteredMoulds.map((mould) => {
-              const relatedRuns = runs.filter((run) => run.mouldId === mould.id)
-              const latestRun = relatedRuns[0]
+              const usage = mould.id === undefined ? undefined : runGroupsByMould.get(mould.id)
               return (
                 <TableRow key={mould.id ?? mould.mouldNo} data-testid="row-mould" hover>
                   <TableCell>
@@ -220,8 +248,8 @@ export default function MouldLedger() {
                   </TableCell>
                   <TableCell>{mould.weaver}</TableCell>
                   <TableCell>
-                    <Typography variant="body2">{relatedRuns.length} 槽工序</Typography>
-                    <Typography variant="caption" color="text.secondary">{latestRun ? `最近 ${latestRun.runDate}` : '尚无关联'}</Typography>
+                    <Typography variant="body2">{usage?.count ?? 0} 槽工序</Typography>
+                    <Typography variant="caption" color="text.secondary">{usage?.latestDate ? `最近 ${usage.latestDate}` : '尚无关联'}</Typography>
                   </TableCell>
                   <TableCell>
                     <Chip size="small" color={mould.state === '在用' ? 'success' : mould.state === '待修补' ? 'warning' : 'default'} label={mould.state} />
@@ -231,9 +259,7 @@ export default function MouldLedger() {
                       size="small"
                       variant={mould.state === '待修补' ? 'contained' : 'outlined'}
                       disabled={mould.state === '退役' || mould.id === undefined}
-                      onClick={() => {
-                        if (mould.id !== undefined) void setMouldState(mould.id, mould.state === '待修补' ? '在用' : '待修补')
-                      }}
+                      onClick={() => openRepair(mould)}
                     >
                       {mould.state === '待修补' ? '完成修补' : '登记修补'}
                     </Button>
@@ -247,6 +273,25 @@ export default function MouldLedger() {
           </TableBody>
         </Table>
       </TableContainer>
+
+      <Dialog open={repairTarget !== null} onClose={() => setRepairTarget(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>纸帘修补 · {repairTarget?.mouldNo}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 0.5 }}>
+            <Alert severity="info">
+              修补后帘纹间距只影响此后新建的工序版本（制版时快照），历史工序的标准间距与偏差保持不变，不回改历史。
+            </Alert>
+            <RulerInput label="修补后帘纹间距" value={repairGap} onChange={setRepairGap} min={0.1} max={5} step={0.01} testId="field-repairGap" />
+            <Typography variant="caption" color="text.secondary">
+              推算密度 {calculateMeshDensity(repairTarget?.wireDiameter ?? 0.25, repairGap).toFixed(1)} 根/cm；确认后纸帘状态将{repairTarget?.state === '待修补' ? '恢复为在用' : '转为待修补'}。
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRepairTarget(null)}>取消</Button>
+          <Button variant="contained" onClick={handleRepair} data-testid="submit-repair">确认修补</Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
   )
 }

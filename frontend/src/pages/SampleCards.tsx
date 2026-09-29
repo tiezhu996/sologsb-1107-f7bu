@@ -8,11 +8,12 @@ import { useMouldStore } from '../stores/mouldStore'
 import { useRunStore } from '../stores/runStore'
 import { useSampleStore } from '../stores/sampleStore'
 import { EVENNESS_LEVELS, type EvennessLevel, type PaperSampleInput } from '../types/paper-sample'
+import { groupRuns, versionById, versionLabel } from '../utils/revisions'
 import { isGapOutOfTolerance } from '../utils/stripe'
 
 const emptySampleForm: PaperSampleInput = {
   sampleNo: '',
-  runId: 1,
+  runVersionId: null,
   sizeMm: 210,
   stripeCount: 45,
   evenness: '均匀',
@@ -49,8 +50,21 @@ export default function SampleCards() {
     void loadMoulds()
   }, [loadMoulds, loadRuns, loadSamples])
 
-  const runById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs])
-  const mouldById = useMemo(() => new Map(moulds.map((mould) => [mould.id, mould])), [moulds])
+  const runVersionMap = useMemo(() => versionById(runs), [runs])
+  const mouldById = useMemo(() => {
+    const map = new Map<number, (typeof moulds)[number]>()
+    for (const mould of moulds) {
+      if (mould.id !== undefined) map.set(mould.id, mould)
+    }
+    return map
+  }, [moulds])
+
+  // 登记样本时只能选择各槽的最新有效版
+  const currentVersionOptions = useMemo(
+    () => groupRuns(runs).filter((group) => group.current && !group.conflicted).map((group) => group.current!),
+    [runs],
+  )
+
   const filteredSamples = useMemo(
     () => samples.filter((sample) => (evennessFilter === '全部' || sample.evenness === evennessFilter) && sample.stripeCount >= stripeFloor),
     [evennessFilter, samples, stripeFloor],
@@ -63,7 +77,7 @@ export default function SampleCards() {
   }
 
   const handleSubmit = async () => {
-    if (!form.sampleNo.trim() || !form.archiveBin.trim() || form.sizeMm <= 0 || form.stripeCount <= 0) return
+    if (!form.sampleNo.trim() || !form.archiveBin.trim() || form.sizeMm <= 0 || form.stripeCount <= 0 || form.runVersionId === null) return
     setSubmitting(true)
     const created = await addSample({ ...form, sampleNo: form.sampleNo.trim(), archiveBin: form.archiveBin.trim() })
     setSubmitting(false)
@@ -80,7 +94,9 @@ export default function SampleCards() {
       <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: { xs: 'flex-start', md: 'center' }, flexDirection: { xs: 'column', md: 'row' } }}>
         <Box>
           <Typography component="h1" variant="h3" color="#344a34">成纸样本与透光检验卡</Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.75 }}>按匀度与帘纹条数分档，复核样本对应的抄纸工序和归档位置。</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.75 }}>
+            样本固定引用登记时的工序版本，不随后续复测更正漂移；作废版本的样本标明失效。
+          </Typography>
         </Box>
         <Button variant="contained" size="large" onClick={() => setShowForm((current) => !current)} data-testid="new-sample">
           {showForm ? '收起登记' : '新建样本'}
@@ -96,9 +112,18 @@ export default function SampleCards() {
             <Grid container spacing={2}>
               <Grid item xs={12} md={3}><TextField fullWidth label="样本编号" value={form.sampleNo} onChange={(event) => updateForm('sampleNo', event.target.value)} inputProps={{ 'data-testid': 'field-sampleNo' }} /></Grid>
               <Grid item xs={12} md={4}>
-                <TextField select fullWidth label="对应工序" value={form.runId} onChange={(event) => updateForm('runId', Number(event.target.value))} SelectProps={{ native: true, inputProps: { 'data-testid': 'field-runId' } }}>
-                  {!runs.some((run) => run.id === form.runId) && <option value={form.runId}>工序数据载入中</option>}
-                  {runs.map((run) => <option key={run.id} value={run.id}>{run.runNo} · {run.runDate}</option>)}
+                <TextField
+                  select
+                  fullWidth
+                  label="对应工序版本"
+                  value={form.runVersionId ?? ''}
+                  onChange={(event) => updateForm('runVersionId', event.target.value === '' ? null : Number(event.target.value))}
+                  SelectProps={{ native: true, inputProps: { 'data-testid': 'field-runVersionId' } }}
+                >
+                  <option value="" disabled>选择工序版本</option>
+                  {currentVersionOptions.map((version) => (
+                    <option key={version.id} value={version.id}>{version.runNo} · {versionLabel(version)} · {version.runDate}</option>
+                  ))}
                 </TextField>
               </Grid>
               <Grid item xs={6} md={2}><TextField fullWidth type="number" label="样本尺寸" value={form.sizeMm} onChange={(event) => updateForm('sizeMm', Number(event.target.value))} inputProps={{ min: 20, max: 1000, step: 1, 'data-testid': 'field-sizeMm' }} InputProps={{ endAdornment: 'mm' }} /></Grid>
@@ -112,7 +137,7 @@ export default function SampleCards() {
             </Grid>
             <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1.5, mt: 2.5 }}>
               <Button onClick={() => setShowForm(false)}>取消</Button>
-              <Button variant="contained" onClick={handleSubmit} disabled={submitting} data-testid="submit-sample">保存样本</Button>
+              <Button variant="contained" onClick={handleSubmit} disabled={submitting || form.runVersionId === null} data-testid="submit-sample">保存样本</Button>
             </Box>
           </CardContent>
         </Card>
@@ -146,36 +171,59 @@ export default function SampleCards() {
 
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(2, minmax(0, 1fr))', xl: 'repeat(3, minmax(0, 1fr))' }, gap: 2 }}>
         {filteredSamples.map((sample) => {
-          const run = runById.get(sample.runId)
-          const mould = run ? mouldById.get(run.mouldId) : undefined
+          const version = sample.runVersionId === null ? undefined : runVersionMap.get(sample.runVersionId)
+          const mould = version ? mouldById.get(version.mouldId) : undefined
           const tier = stripeTier(sample.stripeCount)
-          const gap = run?.measuredGap ?? mould?.stripeGap ?? 1
+          const voided = version?.voided === true
+          const gap = version?.measuredGap ?? mould?.stripeGap ?? 1
+          const deviation = version && typeof version.deviation === 'number' ? version.deviation : null
           return (
-            <Card key={sample.id ?? sample.sampleNo} data-testid="row-sample" sx={{ bgcolor: sample.evenness === '均匀' ? '#fffdf7' : '#fff9e8' }}>
+            <Card
+              key={sample.id ?? sample.sampleNo}
+              data-testid="row-sample"
+              sx={{
+                bgcolor: voided ? '#f1ede4' : sample.evenness === '均匀' ? '#fffdf7' : '#fff9e8',
+                opacity: voided ? 0.85 : 1,
+                borderStyle: voided ? 'dashed' : undefined,
+              }}
+            >
               <CardContent sx={{ p: 2.25 }}>
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1.5, alignItems: 'flex-start', mb: 1.5 }}>
                   <Box>
                     <Typography variant="h6" sx={{ fontWeight: 800 }}>{sample.sampleNo}</Typography>
-                    <Typography variant="caption" color="text.secondary">工序 {run?.runNo ?? '待关联'} · {run?.runDate ?? '日期待补'}</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      工序 {version?.runNo ?? '待关联'} · {version ? versionLabel(version) : '版本待补'} · {version?.runDate ?? '日期待补'}
+                    </Typography>
                   </Box>
-                  <Chip size="small" color={tier.color} label={tier.label} />
+                  <Stack direction="row" spacing={0.5} flexWrap="wrap" justifyContent="flex-end">
+                    {voided && <Chip size="small" color="default" label="失效" />}
+                    <Chip size="small" color={tier.color} label={tier.label} />
+                  </Stack>
                 </Box>
+                {voided && (
+                  <Alert severity="warning" sx={{ mb: 1.5 }}>
+                    该样本引用的工序版本已作废（{version?.voidReason || '作废原因未填'}），样本记录仍保留，偏差不再计入复检统计。
+                  </Alert>
+                )}
                 <GrainStripePreview
                   gap={gap}
                   wireDiameter={mould?.wireDiameter ?? 0.25}
                   density={mould?.meshDensity}
                   stripeCount={sample.stripeCount}
-                  direction={run?.stripeDirection === '横帘纹' ? 'horizontal' : 'vertical'}
+                  direction={version?.stripeDirection === '横帘纹' ? 'horizontal' : 'vertical'}
                 />
                 <Grid container spacing={1} sx={{ mt: 1 }}>
                   <Grid item xs={6}><Typography variant="caption" color="text.secondary">帘纹条数</Typography><Typography sx={{ fontWeight: 700 }}>{sample.stripeCount} 条</Typography></Grid>
                   <Grid item xs={6}><Typography variant="caption" color="text.secondary">匀度</Typography><Typography sx={{ fontWeight: 700, color: sample.evenness === '均匀' ? 'success.dark' : 'warning.dark' }}>{sample.evenness}</Typography></Grid>
                   <Grid item xs={6}><Typography variant="caption" color="text.secondary">样本尺寸</Typography><Typography>{sample.sizeMm} mm · {mmToCm(sample.sizeMm)} cm</Typography></Grid>
-                  <Grid item xs={6}><Typography variant="caption" color="text.secondary">纸页克重</Typography><Typography>{run ? formatGrammage(run.grammage) : '待补'}</Typography></Grid>
+                  <Grid item xs={6}><Typography variant="caption" color="text.secondary">纸页克重</Typography><Typography>{version ? formatGrammage(version.grammage) : '待补'}</Typography></Grid>
                 </Grid>
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 1, alignItems: 'center', mt: 1.5 }}>
                   <Chip size="small" variant="outlined" label={`存档 ${sample.archiveBin}`} />
-                  {run && isGapOutOfTolerance(run.deviation) && <Chip size="small" color="warning" label={`偏差 ${run.deviation > 0 ? '+' : ''}${run.deviation.toFixed(2)} mm`} />}
+                  {deviation !== null && !voided && isGapOutOfTolerance(deviation) && (
+                    <Chip size="small" color="warning" label={`偏差 ${deviation > 0 ? '+' : ''}${deviation.toFixed(2)} mm`} />
+                  )}
+                  {voided && <Chip size="small" variant="outlined" label="引用版本已作废" />}
                 </Box>
               </CardContent>
             </Card>

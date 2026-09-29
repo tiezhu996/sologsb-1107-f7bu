@@ -7,6 +7,7 @@ import { useFiberStore } from '../stores/fiberStore'
 import { useMouldStore } from '../stores/mouldStore'
 import { useRunStore } from '../stores/runStore'
 import { useSampleStore } from '../stores/sampleStore'
+import { groupRuns, versionById } from '../utils/revisions'
 import { isGapOutOfTolerance } from '../utils/stripe'
 
 function startOfCurrentWeek(): Date {
@@ -56,15 +57,36 @@ export default function Dashboard() {
   }, [loadBatches, loadMoulds, loadRuns, loadSamples])
 
   const { filteredMoulds: activeMoulds } = useMouldFilter(moulds, '', '在用')
-  const currentWeekRuns = useMemo(() => runs.filter((run) => isInCurrentWeek(run.runDate)), [runs])
-  const runById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs])
+
+  const groups = useMemo(() => groupRuns(runs), [runs])
+  const runVersionMap = useMemo(() => versionById(runs), [runs])
+
+  // 本周工序：每槽只统计最新有效版；并列有效版（冲突）的槽停止计入
+  const currentWeekRuns = useMemo(
+    () => groups.filter((group) => group.current && isInCurrentWeek(group.current.runDate)).map((group) => group.current!),
+    [groups],
+  )
+  const conflictGroups = useMemo(() => groups.filter((group) => group.conflicted), [groups])
+
+  // 待复检：引用版本有效，且匀度非「均匀」或偏差超差；作废版本的样本不计入
   const pendingSamples = useMemo(
     () => samples.filter((sample) => {
-      const run = runById.get(sample.runId)
-      return sample.evenness !== '均匀' || (run ? isGapOutOfTolerance(run.deviation) : false)
+      const version = sample.runVersionId === null ? undefined : runVersionMap.get(sample.runVersionId)
+      if (!version || version.voided) return false
+      return sample.evenness !== '均匀' || (typeof version.deviation === 'number' && isGapOutOfTolerance(version.deviation))
     }),
-    [runById, samples],
+    [runVersionMap, samples],
   )
+
+  // 作废版本样本：仍列出并标明「失效」，但不占待复检统计
+  const voidedSamples = useMemo(
+    () => samples.filter((sample) => {
+      const version = sample.runVersionId === null ? undefined : runVersionMap.get(sample.runVersionId)
+      return version?.voided === true
+    }),
+    [runVersionMap, samples],
+  )
+
   const activeRate = moulds.length ? Math.round((activeMoulds.length / moulds.length) * 100) : 0
   const error = mouldError ?? batchError ?? runError ?? sampleError
 
@@ -75,16 +97,22 @@ export default function Dashboard() {
           工作台
         </Typography>
         <Typography color="text.secondary" sx={{ mt: 0.75 }}>
-          汇总纸帘状态、料批与本周工序，优先处理超差帘纹和待复检样本。
+          汇总纸帘状态、料批与本周工序，优先处理超差帘纹和待复检样本；作废版本不再计入统计。
         </Typography>
       </Box>
 
       {error && <Alert severity="warning">{error}</Alert>}
 
+      {conflictGroups.length > 0 && (
+        <Alert severity="warning" data-testid="conflict-alert">
+          有 {conflictGroups.length} 槽工序存在两个并列有效版本（{conflictGroups.map((group) => group.runNo).join('、')}），已停止计入统计，请在抄纸工序页核对作废多余版本。
+        </Alert>
+      )}
+
       <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
         <StatBadge label="在册纸帘" value={moulds.length} detail={`在用 ${activeMoulds.length} 张`} />
         <StatBadge label="纤维料批" value={batches.length} detail="覆盖四类造纸纤维" tone="bamboo" />
-        <StatBadge label="本周工序" value={currentWeekRuns.length} detail="按自然周统计" tone="bamboo" />
+        <StatBadge label="本周工序" value={currentWeekRuns.length} detail="按自然周 · 最新有效版" tone="bamboo" />
         <StatBadge label="待复检样本" value={pendingSamples.length} detail="匀度或帘纹偏差需复核" tone={pendingSamples.length ? 'warning' : 'neutral'} />
       </Box>
 
@@ -146,7 +174,7 @@ export default function Dashboard() {
             <Box>
               <Typography variant="h5">待复检样本</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                偏差绝对值超过 0.2 mm 或透光匀度不达“均匀”的记录标黄。
+                偏差绝对值超过 0.2 mm 或透光匀度不达“均匀”的记录标黄；引用版本作废的样本标明失效，不计入统计。
               </Typography>
             </Box>
             <Chip label={`${pendingSamples.length} 条提醒`} color={pendingSamples.length ? 'warning' : 'success'} />
@@ -156,7 +184,7 @@ export default function Dashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>样本号</TableCell>
-                  <TableCell>对应工序</TableCell>
+                  <TableCell>对应工序版本</TableCell>
                   <TableCell>匀度</TableCell>
                   <TableCell align="right">帘纹条数</TableCell>
                   <TableCell>帘纹偏差</TableCell>
@@ -165,12 +193,12 @@ export default function Dashboard() {
               </TableHead>
               <TableBody>
                 {pendingSamples.map((sample) => {
-                  const run = runById.get(sample.runId)
-                  const deviation = run?.deviation ?? 0
+                  const version = sample.runVersionId === null ? undefined : runVersionMap.get(sample.runVersionId)
+                  const deviation = version?.deviation ?? 0
                   return (
                     <TableRow key={sample.id ?? sample.sampleNo} sx={{ bgcolor: '#fff8df' }}>
                       <TableCell sx={{ fontWeight: 700 }}>{sample.sampleNo}</TableCell>
-                      <TableCell>{run?.runNo ?? '工序待关联'}</TableCell>
+                      <TableCell>{version ? `${version.runNo} · v${version.versionNo ?? 1}` : '版本待补'}</TableCell>
                       <TableCell>{sample.evenness}</TableCell>
                       <TableCell align="right">{sample.stripeCount}</TableCell>
                       <TableCell>
@@ -180,9 +208,14 @@ export default function Dashboard() {
                     </TableRow>
                   )
                 })}
-                {pendingSamples.length === 0 && (
+                {pendingSamples.length === 0 && voidedSamples.length === 0 && (
                   <TableRow>
                     <TableCell colSpan={6} align="center" sx={{ py: 4 }}>当前没有待复检样本</TableCell>
+                  </TableRow>
+                )}
+                {pendingSamples.length === 0 && voidedSamples.length > 0 && (
+                  <TableRow>
+                    <TableCell colSpan={6} align="center" sx={{ py: 4 }}>当前没有待复检样本，另有 {voidedSamples.length} 份失效样本留档可查</TableCell>
                   </TableRow>
                 )}
               </TableBody>

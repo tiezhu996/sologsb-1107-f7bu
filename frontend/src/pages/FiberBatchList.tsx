@@ -4,6 +4,7 @@ import { RulerInput } from '../components/common/RulerInput'
 import { useFiberStore } from '../stores/fiberStore'
 import { useRunStore } from '../stores/runStore'
 import { BLEACH_METHODS, COOK_AGENTS, FIBER_MATERIALS, type FiberBatchInput, type FiberMaterial, type CookAgent, type BleachMethod } from '../types/fiber-batch'
+import { groupRuns } from '../utils/revisions'
 
 const emptyFiberForm: FiberBatchInput = {
   batchNo: '',
@@ -41,6 +42,18 @@ export default function FiberBatchList() {
   const averageDegree = filteredBatches.length
     ? filteredBatches.reduce((sum, batch) => sum + batch.beatingDegree, 0) / filteredBatches.length
     : 0
+
+  // 引用关系按槽统计，只显示最新有效版；并列有效版的槽不展示
+  const currentRunsByBatch = useMemo(() => {
+    const map = new Map<number, NonNullable<ReturnType<typeof groupRuns>[number]['current']>[]>()
+    for (const group of groupRuns(runs)) {
+      if (!group.current || group.conflicted) continue
+      const list = map.get(group.current.batchId) ?? []
+      list.push(group.current)
+      map.set(group.current.batchId, list)
+    }
+    return map
+  }, [runs])
 
   const updateForm = <K extends keyof FiberBatchInput,>(key: K, value: FiberBatchInput[K]) => {
     setForm((current) => ({ ...current, [key]: value }))
@@ -127,7 +140,7 @@ export default function FiberBatchList() {
 
       <Stack spacing={1.5}>
         {filteredBatches.map((batch) => {
-          const relatedRuns = runs.filter((run) => run.batchId === batch.id)
+          const relatedRuns = batch.id === undefined ? [] : (currentRunsByBatch.get(batch.id) ?? [])
           return (
             <Accordion key={batch.id ?? batch.batchNo} data-testid="row-fiber" disableGutters sx={{ border: '1px solid #ddd2bd', borderRadius: '10px !important', '&::before': { display: 'none' } }}>
               <AccordionSummary expandIcon={<Box component="span" aria-hidden="true" sx={{ fontSize: 20, lineHeight: 1 }}>⌄</Box>}>

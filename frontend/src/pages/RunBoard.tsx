@@ -1,13 +1,36 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Alert, Box, Button, Card, CardContent, Chip, Grid, Stack, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TextField, Typography } from '@mui/material'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import {
+  Alert,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Grid,
+  Stack,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  TextField,
+  Typography,
+} from '@mui/material'
 import { ProcessTimeline, type ProcessStep } from '../components/common/ProcessTimeline'
 import { RulerInput } from '../components/common/RulerInput'
 import { useUnitConvert } from '../hooks/useUnitConvert'
 import { useFiberStore } from '../stores/fiberStore'
 import { useMouldStore } from '../stores/mouldStore'
 import { useRunStore } from '../stores/runStore'
-import { DRY_METHODS, STRIPE_DIRECTIONS, type DryMethod, type SheetRunInput, type StripeDirection } from '../types/sheet-run'
-import { calculateDeviation, getGapConclusion, isGapOutOfTolerance } from '../utils/stripe'
+import { DRY_METHODS, STRIPE_DIRECTIONS, type DryMethod, type SheetRun, type SheetRunInput, type StripeDirection } from '../types/sheet-run'
+import { getGapConclusion, isGapOutOfTolerance } from '../utils/stripe'
+import { groupRuns, type RunGroup } from '../utils/revisions'
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10)
@@ -36,12 +59,20 @@ const processSteps: ProcessStep[] = [
   { label: '量纹偏差', detail: '实测间距并与纸帘标准值比较。', status: 'pending' },
 ]
 
+function formatDateTime(value: string | null): string {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return `${date.toISOString().slice(0, 10)} ${date.toISOString().slice(11, 16)}`
+}
+
 export default function RunBoard() {
   const runs = useRunStore((state) => state.sheetRuns)
   const runError = useRunStore((state) => state.error)
   const loadRuns = useRunStore((state) => state.loadRuns)
   const addRun = useRunStore((state) => state.addRun)
-  const updateMeasuredGap = useRunStore((state) => state.updateMeasuredGap)
+  const reviseRun = useRunStore((state) => state.reviseRun)
+  const voidRunVersion = useRunStore((state) => state.voidRunVersion)
   const moulds = useMouldStore((state) => state.moulds)
   const mouldError = useMouldStore((state) => state.error)
   const loadMoulds = useMouldStore((state) => state.loadMoulds)
@@ -52,8 +83,14 @@ export default function RunBoard() {
   const [form, setForm] = useState<SheetRunInput>(emptyRunForm)
   const [dateFilter, setDateFilter] = useState('')
   const [mouldFilter, setMouldFilter] = useState('全部')
-  const [draftGaps, setDraftGaps] = useState<Record<number, number>>({})
   const [submitting, setSubmitting] = useState(false)
+  const [expandedRunNo, setExpandedRunNo] = useState<string | null>(null)
+  const [reviseTarget, setReviseTarget] = useState<SheetRun | null>(null)
+  const [reviseGap, setReviseGap] = useState(0)
+  const [reviseReason, setReviseReason] = useState('')
+  const [voidTarget, setVoidTarget] = useState<SheetRun | null>(null)
+  const [voidReason, setVoidReason] = useState('')
+  const [dialogError, setDialogError] = useState('')
   const { formatGrammage, cmToMm } = useUnitConvert()
 
   useEffect(() => {
@@ -62,20 +99,49 @@ export default function RunBoard() {
     void loadBatches()
   }, [loadBatches, loadMoulds, loadRuns])
 
-  const mouldById = useMemo(() => new Map(moulds.map((mould) => [mould.id, mould])), [moulds])
-  const batchById = useMemo(() => new Map(batches.map((batch) => [batch.id, batch])), [batches])
-  const filteredRuns = useMemo(
-    () => runs.filter((run) => {
-      const mould = mouldById.get(run.mouldId)
-      const matchesDate = !dateFilter || run.runDate === dateFilter
+  const mouldById = useMemo(() => {
+    const map = new Map<number, (typeof moulds)[number]>()
+    for (const mould of moulds) {
+      if (mould.id !== undefined) map.set(mould.id, mould)
+    }
+    return map
+  }, [moulds])
+  const batchById = useMemo(() => {
+    const map = new Map<number, (typeof batches)[number]>()
+    for (const batch of batches) {
+      if (batch.id !== undefined) map.set(batch.id, batch)
+    }
+    return map
+  }, [batches])
+
+  const groups = useMemo(() => groupRuns(runs), [runs])
+
+  const filteredGroups = useMemo(
+    () => groups.filter((group) => {
+      // 冲突 / 全部作废的槽始终列出，便于指出并处理
+      if (!group.current) return true
+      const mould = mouldById.get(group.current.mouldId)
+      const matchesDate = !dateFilter || group.current.runDate === dateFilter
       const matchesMould = mouldFilter === '全部' || mould?.mouldNo === mouldFilter
       return matchesDate && matchesMould
     }),
-    [dateFilter, mouldById, mouldFilter, runs],
+    [dateFilter, mouldById, mouldFilter, groups],
   )
+
+  const conflictGroups = useMemo(() => groups.filter((group) => group.conflicted), [groups])
+  const activeCount = useMemo(
+    () => groups.filter((group) => group.current && (!dateFilter || group.current.runDate === dateFilter) && (mouldFilter === '全部' || mouldById.get(group.current.mouldId)?.mouldNo === mouldFilter)).length,
+    [dateFilter, mouldById, mouldFilter, groups],
+  )
+
   const selectedMould = mouldById.get(form.mouldId) ?? moulds[0]
-  const formDeviation = calculateDeviation(form.measuredGap, selectedMould?.stripeGap ?? form.measuredGap)
-  const latestRun = runs[0]
+  const formDeviation = selectedMould ? form.measuredGap - selectedMould.stripeGap : form.measuredGap
+  const latestGroup = useMemo(() => {
+    const active = groups.filter((group) => group.current)
+    active.sort((a, b) => (b.current?.runDate ?? '').localeCompare(a.current?.runDate ?? ''))
+    return active[0] ?? null
+  }, [groups])
+  const latestRun = latestGroup?.current ?? null
 
   const updateForm = <K extends keyof SheetRunInput,>(key: K, value: SheetRunInput[K]) => {
     setForm((current) => ({ ...current, [key]: value }))
@@ -85,14 +151,14 @@ export default function RunBoard() {
     setForm((current) => {
       const mould = mouldById.get(mouldId)
       const standardGap = mould?.stripeGap ?? current.measuredGap
-      return { ...current, mouldId, measuredGap: standardGap, deviation: calculateDeviation(standardGap, standardGap) }
+      return { ...current, mouldId, measuredGap: standardGap, deviation: 0 }
     })
   }
 
   const handleSubmit = async () => {
     if (!form.runNo.trim() || !form.operator.trim() || form.measuredGap <= 0 || form.grammage <= 0) return
     setSubmitting(true)
-    const created = await addRun({ ...form, runNo: form.runNo.trim(), operator: form.operator.trim(), deviation: formDeviation })
+    const created = await addRun({ ...form, runNo: form.runNo.trim(), operator: form.operator.trim(), deviation: formDeviation }, selectedMould)
     setSubmitting(false)
     if (created) {
       setForm(emptyRunForm)
@@ -100,14 +166,107 @@ export default function RunBoard() {
     }
   }
 
+  const openRevise = (version: SheetRun) => {
+    setReviseTarget(version)
+    setReviseGap(version.measuredGap)
+    setReviseReason('')
+    setDialogError('')
+  }
+
+  const handleRevise = async () => {
+    if (!reviseTarget || reviseTarget.id === undefined) return
+    if (!reviseReason.trim()) {
+      setDialogError('请填写更正原因，历史版本将保留并标注原因')
+      return
+    }
+    const mould = mouldById.get(reviseTarget.mouldId)
+    const created = await reviseRun(reviseTarget.id, reviseGap, reviseReason, mould)
+    if (created) {
+      setReviseTarget(null)
+      setExpandedRunNo(created.runNo)
+    } else {
+      setDialogError(runError ?? '复测更正失败')
+    }
+  }
+
+  const openVoid = (version: SheetRun) => {
+    setVoidTarget(version)
+    setVoidReason('')
+    setDialogError('')
+  }
+
+  const handleVoid = async () => {
+    if (!voidTarget || voidTarget.id === undefined) return
+    if (!voidReason.trim()) {
+      setDialogError('请填写作废原因')
+      return
+    }
+    await voidRunVersion(voidTarget.id, voidReason)
+    setVoidTarget(null)
+  }
+
   const error = runError ?? mouldError ?? batchError
+
+  const renderVersionRow = (group: RunGroup, version: SheetRun) => {
+    const mould = mouldById.get(version.mouldId)
+    const batch = batchById.get(version.batchId)
+    const isCurrent = group.current?.id === version.id
+    const deviation = typeof version.deviation === 'number' ? version.deviation : null
+    const deviationText = deviation === null ? '—' : `${deviation > 0 ? '+' : ''}${deviation.toFixed(2)} mm`
+    return (
+      <TableRow key={version.id ?? `${version.runNo}-${version.versionNo}`} sx={{ bgcolor: version.voided ? '#f1ede4' : isCurrent ? '#f4f7ef' : undefined }}>
+        <TableCell>
+          <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
+            <Typography sx={{ fontWeight: isCurrent ? 750 : 600 }}>v{version.versionNo ?? 1}</Typography>
+            {isCurrent && <Chip size="small" color="success" label="最新有效版" />}
+            {(version.versionNo ?? 1) === 1 && <Chip size="small" variant="outlined" label="基线版" />}
+            {version.voided && <Chip size="small" color="default" label="已作废" />}
+          </Stack>
+          <Typography variant="caption" color="text.secondary">{version.reason || '未记录原因'}</Typography>
+        </TableCell>
+        <TableCell>
+          <Typography variant="body2">{mould?.mouldNo ?? '纸帘待补'}</Typography>
+          <Typography variant="caption" color="text.secondary">{batch?.batchNo ?? '料批待补'}</Typography>
+        </TableCell>
+        <TableCell>
+          <Typography variant="body2">实测 {Number.isFinite(version.measuredGap) ? `${version.measuredGap.toFixed(2)} mm` : '—'}</Typography>
+          <Typography variant="caption" color="text.secondary">
+            标准 {version.standardGap === null || version.standardGap === undefined ? '—' : `${version.standardGap.toFixed(2)} mm`}（制版快照）
+          </Typography>
+        </TableCell>
+        <TableCell>
+          <Chip
+            size="small"
+            color={deviation === null ? 'default' : isGapOutOfTolerance(deviation) ? 'warning' : 'default'}
+            variant={deviation === null || isGapOutOfTolerance(deviation) ? 'filled' : 'outlined'}
+            label={deviationText}
+          />
+        </TableCell>
+        <TableCell>
+          <Typography variant="caption" color="text.secondary">{version.runDate} · {version.operator}</Typography>
+        </TableCell>
+        <TableCell>
+          {version.voided ? (
+            <Box>
+              <Typography variant="caption" color="text.secondary">作废：{version.voidReason || '未填原因'}</Typography>
+              <Typography variant="caption" display="block" color="text.secondary">{formatDateTime(version.voidedAt)}</Typography>
+            </Box>
+          ) : (
+            <Typography variant="caption" color="text.secondary">更正于 {formatDateTime(version.revisedAt)}</Typography>
+          )}
+        </TableCell>
+      </TableRow>
+    )
+  }
 
   return (
     <Stack spacing={3}>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: { xs: 'flex-start', md: 'center' }, flexDirection: { xs: 'column', md: 'row' } }}>
         <Box>
           <Typography component="h1" variant="h3" color="#344a34">抄纸工序记录台</Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.75 }}>关联纸帘与料批，记录抄纸参数，并在行内复测帘纹间距。</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.75 }}>
+            每槽工序保留修订链：复测更正生成新版并写明原因，样本固定引用当时版本，作废版本留档可查。
+          </Typography>
         </Box>
         <Button variant="contained" size="large" onClick={() => setShowForm((current) => !current)} data-testid="new-run">
           {showForm ? '收起登记' : '新建工序'}
@@ -115,6 +274,12 @@ export default function RunBoard() {
       </Box>
 
       {error && <Alert severity="warning">{error}</Alert>}
+
+      {conflictGroups.length > 0 && (
+        <Alert severity="warning" data-testid="conflict-alert">
+          有 {conflictGroups.length} 槽工序存在两个并列有效版本（{conflictGroups.map((group) => group.runNo).join('、')}），已停止计入统计，请核对后作废多余版本。
+        </Alert>
+      )}
 
       {showForm && (
         <Card data-testid="form-run" sx={{ borderColor: '#9eb096' }}>
@@ -196,8 +361,8 @@ export default function RunBoard() {
                 </Grid>
                 <Grid item xs={4} md={2}>
                   <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1 }}>
-                    <Typography variant="body2" color="text.secondary">记录数</Typography>
-                    <Typography variant="h5" data-testid="count-run">{filteredRuns.length}</Typography>
+                    <Typography variant="body2" color="text.secondary">有效工序</Typography>
+                    <Typography variant="h5" data-testid="count-run">{activeCount}</Typography>
                   </Box>
                 </Grid>
                 <Grid item xs={12} md={2}><Button fullWidth variant="outlined" onClick={() => { setDateFilter(''); setMouldFilter('全部') }}>重置</Button></Grid>
@@ -216,68 +381,266 @@ export default function RunBoard() {
               <TableCell>抄纸参数</TableCell>
               <TableCell align="right">克重</TableCell>
               <TableCell>实测间距与偏差</TableCell>
-              <TableCell align="right">保存实测</TableCell>
+              <TableCell align="right">版本操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
-            {filteredRuns.map((run) => {
-              const mould = mouldById.get(run.mouldId)
-              const batch = batchById.get(run.batchId)
-              const draftGap = run.id === undefined ? run.measuredGap : draftGaps[run.id] ?? run.measuredGap
-              const draftDeviation = calculateDeviation(draftGap, mould?.stripeGap ?? draftGap)
-              const exceeded = isGapOutOfTolerance(draftDeviation)
+            {filteredGroups.map((group) => {
+              const run = group.current
+              const mould = run ? mouldById.get(run.mouldId) : undefined
+              const batch = run ? batchById.get(run.batchId) : undefined
+              const deviation = run && typeof run.deviation === 'number' ? run.deviation : null
+              const exceeded = deviation !== null && isGapOutOfTolerance(deviation)
+              const expanded = expandedRunNo === group.runNo
               return (
-                <TableRow key={run.id ?? run.runNo} data-testid="row-run" hover sx={{ bgcolor: exceeded ? '#fff7d9' : undefined }}>
-                  <TableCell>
-                    <Typography sx={{ fontWeight: 750 }}>{run.runNo}</Typography>
-                    <Typography variant="caption" color="text.secondary">{run.runDate} · {run.operator}</Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2">{mould?.mouldNo ?? '未关联纸帘'}</Typography>
-                    <Typography variant="caption" color="text.secondary">{batch?.batchNo ?? '未关联料批'} · {batch?.material ?? '待补'}</Typography>
-                  </TableCell>
-                  <TableCell>
-                    <Typography variant="body2">{run.stripeDirection} · 荡料 {run.dipCount} 次</Typography>
-                    <Typography variant="caption" color="text.secondary">叠高 {run.stackHeight} 张 · {run.dryMethod} · 帘框 {cmToMm(mould?.frameW ?? 0)} × {cmToMm(mould?.frameH ?? 0)} mm</Typography>
-                  </TableCell>
-                  <TableCell align="right">{run.grammage} g/m²</TableCell>
-                  <TableCell sx={{ minWidth: 270 }}>
-                    <RulerInput
-                      label="帘纹间距"
-                      value={draftGap}
-                      onChange={(value) => {
-                        if (run.id !== undefined) setDraftGaps((current) => ({ ...current, [run.id as number]: value }))
-                      }}
-                      min={0.1}
-                      max={5}
-                      step={0.01}
-                      testId={run.id === undefined ? undefined : `row-measuredGap-${run.id}`}
-                      helperText={<Typography component="span" variant="caption" color={exceeded ? 'warning.dark' : 'text.secondary'}>{exceeded ? '超差：' : '合格：'}{getGapConclusion(draftDeviation)}（{draftDeviation > 0 ? '+' : ''}{draftDeviation.toFixed(2)} mm）</Typography>}
-                      compact
-                    />
-                  </TableCell>
-                  <TableCell align="right">
-                    <Button
-                      size="small"
-                      variant={exceeded ? 'contained' : 'outlined'}
-                      color={exceeded ? 'warning' : 'primary'}
-                      disabled={run.id === undefined || draftGap === run.measuredGap}
-                      onClick={() => {
-                        if (run.id !== undefined) void updateMeasuredGap(run.id, draftGap, mould?.stripeGap ?? draftGap)
-                      }}
-                    >
-                      {draftGap === run.measuredGap ? '已记录' : '保存实测'}
-                    </Button>
-                  </TableCell>
-                </TableRow>
+                <FragmentGroup
+                  key={group.runNo}
+                  group={group}
+                  expanded={expanded}
+                  exceeded={exceeded}
+                  mouldNo={mould?.mouldNo}
+                  batchNo={batch?.batchNo}
+                  batchMaterial={batch?.material}
+                  frameW={mould?.frameW}
+                  frameH={mould?.frameH}
+                  cmToMm={cmToMm}
+                  deviation={deviation}
+                  onToggle={() => setExpandedRunNo(expanded ? null : group.runNo)}
+                  onRevise={openRevise}
+                  onVoid={openVoid}
+                  renderVersionRow={renderVersionRow}
+                />
               )
             })}
-            {filteredRuns.length === 0 && (
+            {filteredGroups.length === 0 && (
               <TableRow><TableCell colSpan={6} align="center" sx={{ py: 5 }}>没有符合日期与帘号条件的工序</TableCell></TableRow>
             )}
           </TableBody>
         </Table>
       </TableContainer>
+
+      {/* 复测更正 */}
+      <Dialog open={reviseTarget !== null} onClose={() => setReviseTarget(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>复测更正 · {reviseTarget?.runNo}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 0.5 }}>
+            <Alert severity="info">
+              更正将保留当前版本（v{reviseTarget?.versionNo ?? 1}）为历史记录并生成新版本，样本仍固定引用其登记时的版本。
+              标准间距取用纸帘当前值 {reviseTarget ? mouldById.get(reviseTarget.mouldId)?.stripeGap.toFixed(2) : '—'} mm（纸帘修补只影响新版本，不回改历史）。
+            </Alert>
+            <RulerInput
+              label="实测帘纹间距"
+              value={reviseGap}
+              onChange={setReviseGap}
+              min={0.1}
+              max={5}
+              step={0.01}
+              testId="field-reviseGap"
+              helperText={reviseTarget ? getGapConclusion(reviseGap - (mouldById.get(reviseTarget.mouldId)?.stripeGap ?? reviseGap)) : ''}
+            />
+            <TextField
+              fullWidth
+              label="更正原因"
+              value={reviseReason}
+              onChange={(event) => setReviseReason(event.target.value)}
+              placeholder="例如：成纸偏密，复测修正间距"
+              inputProps={{ 'data-testid': 'field-reviseReason' }}
+              required
+            />
+            {dialogError && <Alert severity="warning">{dialogError}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setReviseTarget(null)}>取消</Button>
+          <Button variant="contained" onClick={handleRevise} data-testid="submit-revise">生成修订版</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 作废 */}
+      <Dialog open={voidTarget !== null} onClose={() => setVoidTarget(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>作废版本 · {voidTarget?.runNo} v{voidTarget?.versionNo ?? 1}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 0.5 }}>
+            <Alert severity="warning">
+              作废后该版本仍可在版本链中查询；引用该版本的样本会标明「失效」。
+              作废最新有效版后，统计以剩余最新有效版为准。
+            </Alert>
+            <TextField
+              fullWidth
+              label="作废原因"
+              value={voidReason}
+              onChange={(event) => setVoidReason(event.target.value)}
+              placeholder="例如：复测记录抄录有误"
+              inputProps={{ 'data-testid': 'field-voidReason' }}
+              required
+            />
+            {dialogError && <Alert severity="warning">{dialogError}</Alert>}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setVoidTarget(null)}>取消</Button>
+          <Button variant="contained" color="warning" onClick={handleVoid} data-testid="submit-void">确认作废</Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
+  )
+}
+
+/** 表格主体：正常 / 冲突 / 全作废三种形态 + 可展开的版本链。 */
+function FragmentGroup(props: {
+  group: RunGroup
+  expanded: boolean
+  exceeded: boolean
+  mouldNo?: string
+  batchNo?: string
+  batchMaterial?: string
+  frameW?: number
+  frameH?: number
+  cmToMm: (value: number) => number
+  deviation: number | null
+  onToggle: () => void
+  onRevise: (version: SheetRun) => void
+  onVoid: (version: SheetRun) => void
+  renderVersionRow: (group: RunGroup, version: SheetRun) => ReactNode
+}) {
+  const { group } = props
+  const current = group.current
+
+  if (group.conflicted) {
+    return (
+      <>
+        <TableRow data-testid="row-run-conflict" hover sx={{ bgcolor: '#fff3cd' }}>
+          <TableCell>
+            <Typography sx={{ fontWeight: 750 }}>{group.runNo}</Typography>
+            <Chip size="small" color="warning" label="并列有效版" sx={{ mt: 0.5 }} />
+          </TableCell>
+          <TableCell colSpan={4}>
+            <Typography variant="body2" color="warning.dark">
+              该槽存在 {group.versions.filter((version) => !version.voided).length} 个并列有效版本，已停止计入统计。
+            </Typography>
+            <Typography variant="caption" color="text.secondary">请展开版本链核对，作废多余版本后自动恢复统计。</Typography>
+          </TableCell>
+          <TableCell align="right">
+            <Button size="small" onClick={props.onToggle}>{props.expanded ? '收起版本链' : '查看版本链'}</Button>
+          </TableCell>
+        </TableRow>
+        <TableRow>
+          <TableCell colSpan={6} sx={{ p: 0, border: 0 }}>
+            <Collapse in={props.expanded} timeout="auto" unmountOnExit>
+              <VersionChain group={group} renderVersionRow={props.renderVersionRow} />
+            </Collapse>
+          </TableCell>
+        </TableRow>
+      </>
+    )
+  }
+
+  if (group.allVoided) {
+    return (
+      <>
+        <TableRow data-testid="row-run-voided" hover sx={{ bgcolor: '#f1ede4' }}>
+          <TableCell>
+            <Typography sx={{ fontWeight: 750 }}>{group.runNo}</Typography>
+            <Chip size="small" label="全部作废" sx={{ mt: 0.5 }} />
+          </TableCell>
+          <TableCell colSpan={4}>
+            <Typography variant="body2" color="text.secondary">该槽所有版本均已作废，仅留档可查，不计入统计。</Typography>
+          </TableCell>
+          <TableCell align="right">
+            <Button size="small" onClick={props.onToggle}>{props.expanded ? '收起版本链' : '查看版本链'}</Button>
+          </TableCell>
+        </TableRow>
+        <TableRow>
+          <TableCell colSpan={6} sx={{ p: 0, border: 0 }}>
+            <Collapse in={props.expanded} timeout="auto" unmountOnExit>
+              <VersionChain group={group} renderVersionRow={props.renderVersionRow} />
+            </Collapse>
+          </TableCell>
+        </TableRow>
+      </>
+    )
+  }
+
+  if (!current) return null
+
+  return (
+    <>
+      <TableRow data-testid="row-run" hover sx={{ bgcolor: props.exceeded ? '#fff7d9' : undefined }}>
+        <TableCell>
+          <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
+            <Typography sx={{ fontWeight: 750 }}>{current.runNo}</Typography>
+            <Chip size="small" variant="outlined" label={`v${current.versionNo ?? 1}`} />
+            {group.voidedCount > 0 && <Chip size="small" color="default" label={`作废 ${group.voidedCount} 版`} />}
+          </Stack>
+          <Typography variant="caption" color="text.secondary">{current.runDate} · {current.operator}</Typography>
+        </TableCell>
+        <TableCell>
+          <Typography variant="body2">{props.mouldNo ?? '未关联纸帘'}</Typography>
+          <Typography variant="caption" color="text.secondary">{props.batchNo ?? '未关联料批'} · {props.batchMaterial ?? '待补'}</Typography>
+        </TableCell>
+        <TableCell>
+          <Typography variant="body2">{current.stripeDirection} · 荡料 {current.dipCount} 次</Typography>
+          <Typography variant="caption" color="text.secondary">
+            叠高 {current.stackHeight} 张 · {current.dryMethod} · 帘框 {props.frameW ? props.cmToMm(props.frameW) : '—'} × {props.frameH ? props.cmToMm(props.frameH) : '—'} mm
+          </Typography>
+        </TableCell>
+        <TableCell align="right">{current.grammage} g/m²</TableCell>
+        <TableCell sx={{ minWidth: 230 }}>
+          <Typography variant="body2">实测 {Number.isFinite(current.measuredGap) ? `${current.measuredGap.toFixed(2)} mm` : '—'}</Typography>
+          <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mt: 0.4 }}>
+            <Chip
+              size="small"
+              color={props.deviation === null ? 'default' : props.exceeded ? 'warning' : 'success'}
+              variant={props.deviation === null ? 'outlined' : 'filled'}
+              label={props.deviation === null ? '偏差待补' : `${props.deviation > 0 ? '+' : ''}${props.deviation.toFixed(2)} mm`}
+            />
+            <Typography variant="caption" color="text.secondary">标准 {current.standardGap === null || current.standardGap === undefined ? '—' : `${current.standardGap.toFixed(2)} mm`}</Typography>
+          </Stack>
+        </TableCell>
+        <TableCell align="right">
+          <Stack direction="row" spacing={0.5} justifyContent="flex-end">
+            <Button size="small" variant="outlined" onClick={props.onToggle}>
+              {props.expanded ? '收起' : '版本链'}
+            </Button>
+            <Button size="small" variant="contained" onClick={() => props.onRevise(current)} data-testid={`revise-${current.id}`}>
+              复测更正
+            </Button>
+            <Button size="small" color="warning" onClick={() => props.onVoid(current)} data-testid={`void-${current.id}`}>
+              作废
+            </Button>
+          </Stack>
+        </TableCell>
+      </TableRow>
+      <TableRow>
+        <TableCell colSpan={6} sx={{ p: 0, border: 0 }}>
+          <Collapse in={props.expanded} timeout="auto" unmountOnExit>
+            <VersionChain group={group} renderVersionRow={props.renderVersionRow} />
+          </Collapse>
+        </TableCell>
+      </TableRow>
+    </>
+  )
+}
+
+function VersionChain({ group, renderVersionRow }: { group: RunGroup; renderVersionRow: (group: RunGroup, version: SheetRun) => ReactNode }) {
+  return (
+    <Box sx={{ bgcolor: '#faf6ec', px: 2, py: 1.5 }}>
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+        {group.runNo} 版本链（{group.versions.length} 版{group.conflicted ? ' · 存在并列有效版' : ''}）
+      </Typography>
+      <Table size="small">
+        <TableHead>
+          <TableRow>
+            <TableCell>版本 / 原因</TableCell>
+            <TableCell>纸帘 / 料批</TableCell>
+            <TableCell>实测 / 标准</TableCell>
+            <TableCell>偏差</TableCell>
+            <TableCell>抄纸信息</TableCell>
+            <TableCell>状态 / 时间</TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>{group.versions.map((version) => renderVersionRow(group, version))}</TableBody>
+      </Table>
+    </Box>
   )
 }
